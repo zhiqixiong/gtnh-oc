@@ -30,7 +30,7 @@ local gtm = component.gt_machine
 ------------------------------------------------------------
 
 -- 大型原料缓存仓
-local sideCacheBuffer = sides.west
+local sideCacheBuffer = sides.down
 
 -- AE物质聚合器
 -- 用于销毁/移走本轮7种指示材料
@@ -38,7 +38,7 @@ local sideAEInfusion = sides.south
 
 -- 主网 Fluid Interface
 -- 程序通过它选择并抽取目标等离子
-local sideInterface = sides.down
+local sideInterface = sides.east
 
 ------------------------------------------------------------
 -- QGP parameters
