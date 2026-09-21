@@ -691,51 +691,109 @@ end
 -- Craftable是OC AbstractValue/userdata，
 -- 不能要求type(value)必须是table。
 ------------------------------------------------------------
+------------------------------------------------------------
+-- AE Craftable helpers
+------------------------------------------------------------
 
-local function hasRequestMethod(value)
-    if value == nil then
+local function pack(...)
+    return {
+        n = select("#", ...),
+        ...
+    }
+end
+
+local function hasMethod(obj, methodName)
+    if obj == nil then
         return false
     end
 
-    local ok, method =
-        pcall(function()
-            return value.request
-        end)
+    local ok, method = pcall(function()
+        return obj[methodName]
+    end)
 
-    return ok
-        and type(method) == "function"
+    return ok and type(method) == "function"
 end
 
-local function findRequestObject(value, depth)
+------------------------------------------------------------
+-- 检查一个对象是不是目标 Craftable
+------------------------------------------------------------
+
+local function isTargetCraftable(obj, plasmaName)
+
+    if obj == nil then
+        return false
+    end
+
+    if not hasMethod(obj, "request") then
+        return false
+    end
+
+    if not hasMethod(obj, "getStack") then
+        return false
+    end
+
+    local ok, stack = pcall(function()
+        return obj.getStack()
+    end)
+
+    if not ok or stack == nil then
+        return false
+    end
+
+    local name = nil
+
+    local okName = pcall(function()
+        name = stack.name
+    end)
+
+    if not okName then
+        return false
+    end
+
+    return name == plasmaName
+end
+
+------------------------------------------------------------
+-- 递归扫描 getCraftables 返回值
+------------------------------------------------------------
+
+local function searchCraftable(value, plasmaName, depth)
+
     depth = depth or 0
 
-    if value == nil
-        or depth > 4
-    then
+    if depth > 5 or value == nil then
         return nil
     end
 
     --------------------------------------------------------
-    -- 必须先检查request()
-    -- userdata也允许
+    -- value 本身就是 Craftable userdata
     --------------------------------------------------------
 
-    if hasRequestMethod(value) then
+    if isTargetCraftable(
+        value,
+        plasmaName
+    ) then
         return value
     end
 
     --------------------------------------------------------
-    -- 只有普通table才能继续递归
+    -- 不是 table 就没法继续向下找
     --------------------------------------------------------
 
     if type(value) ~= "table" then
         return nil
     end
 
+    --------------------------------------------------------
+    -- 遍历容器
+    --------------------------------------------------------
+
     for _, child in pairs(value) do
+
         local found =
-            findRequestObject(
+            searchCraftable(
                 child,
+                plasmaName,
                 depth + 1
             )
 
@@ -748,27 +806,121 @@ local function findRequestObject(value, depth)
 end
 
 ------------------------------------------------------------
--- Find craftable for target plasma
+-- 获取指定 plasma 的 Craftable
 ------------------------------------------------------------
 
 local function getCraftable(plasmaName)
-    local ok, craftables =
-        pcall(function()
-            return fInterface.getCraftables(
-                {
-                    name = plasmaName
-                }
-            )
-        end)
 
-    if not ok then
+    --------------------------------------------------------
+    -- 方法1：
+    -- 新版 GTNH OC 有 getCraftable(detail, type)
+    --------------------------------------------------------
+
+    if type(fInterface.getCraftable)
+        == "function"
+    then
+
+        local ok, craftable =
+            pcall(function()
+
+                return
+                    fInterface.getCraftable(
+                        {
+                            name = plasmaName
+                        },
+                        "fluid"
+                    )
+            end)
+
+        if ok
+            and craftable
+            and hasMethod(
+                craftable,
+                "request"
+            )
+        then
+
+            print(
+                "[下单] 精确找到配方: "
+                .. plasmaName
+            )
+
+            return craftable
+        end
+    end
+
+    --------------------------------------------------------
+    -- 方法2：
+    -- 兼容2.9b1：
+    --
+    -- 不使用过滤器。
+    -- 直接读取全部可合成项，然后通过 getStack()
+    -- 检查每一个 Craftable 的真实输出。
+    --------------------------------------------------------
+
+    local result =
+        pack(
+            pcall(function()
+
+                return
+                    fInterface.getCraftables()
+            end)
+        )
+
+    --------------------------------------------------------
+    -- pcall第一个返回值
+    --------------------------------------------------------
+
+    if not result[1] then
+
         print(
             "[下单] getCraftables异常: "
-            .. tostring(craftables)
+            .. tostring(result[2])
         )
 
         return nil
     end
+
+    --------------------------------------------------------
+    -- pcall后面的所有返回值都检查
+    --
+    -- 这么写同时兼容：
+    --
+    -- getCraftables() -> table
+    --
+    -- 和某些版本可能出现的：
+    --
+    -- getCraftables() -> value1,value2,...
+    --------------------------------------------------------
+
+    for i = 2, result.n do
+
+        local found =
+            searchCraftable(
+                result[i],
+                plasmaName,
+                0
+            )
+
+        if found then
+
+            print(
+                "[下单] 扫描找到配方: "
+                .. plasmaName
+            )
+
+            return found
+        end
+    end
+
+    print(
+        "[下单] AE中没有找到目标Craftable: "
+        .. plasmaName
+    )
+
+    return nil
+end
+
 
     --------------------------------------------------------
     -- 正常GTNH：
