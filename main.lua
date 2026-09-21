@@ -11,11 +11,7 @@ local sides = require("sides")
 local term = require("term")
 local computer = require("computer")
 
-------------------------------------------------------------
--- Version
-------------------------------------------------------------
-
-local VERSION = "QGP-AUTO 0.3.1"
+local VERSION = "QGP-AUTO 0.3.2"
 
 ------------------------------------------------------------
 -- Components
@@ -26,44 +22,37 @@ local fInterface = component.fluid_interface
 local gtm = component.gt_machine
 
 ------------------------------------------------------------
--- Transposer sides
---
--- 按你当前机器实际方位
+-- Current machine directions
 ------------------------------------------------------------
 
--- 大型原料缓存仓
-local sideCacheBuffer = sides.down
-
--- AE物质聚合器
--- 用于销毁异化器给出的本轮指示材料
-local sideAEInfusion = sides.south
-
--- 主网 Fluid Interface
--- 程序从这里选择并抽取所需等离子体
-local sideInterface = sides.east
+local sideCacheBuffer = sides.down      -- 大型原料缓存仓
+local sideAEInfusion  = sides.south     -- AE物质聚合器
+local sideInterface   = sides.east      -- 主网 Fluid Interface
 
 ------------------------------------------------------------
 -- QGP parameters
 ------------------------------------------------------------
 
--- 每一轮固定7种需求
 local EXPECTED_DEMAND_COUNT = 7
-
--- 异化器输出的普通流体指示量最大64
 local INDICATOR_FLUID_MAX = 64
 
--- 普通流体指示量 -> 等离子需求量
+-- 指示流体 ×1000 -> 所需等离子
 local FLUID_TO_PLASMA = 1000
 
--- 每个粉 -> 等离子需求量
+-- 粉 ×1296 -> 所需等离子
 local DUST_TO_PLASMA = 1296
 
--- AE任务显示完成以后，
--- 给Fluid Interface一点刷新时间
+-- AE合成计划最大等待时间
+local CRAFT_PLAN_TIMEOUT = 60
+
+-- AE显示任务完成后，等待接口刷新
 local CRAFT_DONE_GRACE = 3
 
--- 日志限流
+-- 状态日志输出间隔
 local STATUS_PRINT_INTERVAL = 5
+
+-- AE request最终是int
+local MAX_REQUEST_AMOUNT = 2147483647
 
 ------------------------------------------------------------
 -- BartWorks special materials
@@ -163,7 +152,7 @@ local gtDustPlasmaOverride = {
 local plasmaDemands = {}
 
 ------------------------------------------------------------
--- Helpers
+-- Basic helpers
 ------------------------------------------------------------
 
 local function toNumber(v)
@@ -182,7 +171,7 @@ local function clearScreen()
 end
 
 ------------------------------------------------------------
--- Safe component reads
+-- Safe reads
 ------------------------------------------------------------
 
 local function getFluid(side, tank)
@@ -210,52 +199,128 @@ local function getItem(side, slot)
 end
 
 ------------------------------------------------------------
--- Safe transfers
+-- Safe fluid transfer
+--
+-- 解决：
+-- attempt to compare number with string
+--
+-- transferFluid失败时可能返回：
+-- nil, "reason"
+--
+-- 所以绝不能直接：
+-- local _, moved = transferFluid(...)
+-- if moved > 0 then ...
 ------------------------------------------------------------
 
-local function transferFluidSafe(fromSide, toSide, amount, tank)
+local function transferFluidSafe(
+    fromSide,
+    toSide,
+    amount,
+    sourceTank
+)
     amount = math.floor(toNumber(amount))
 
     if amount <= 0 then
         return 0
     end
 
-    local ok, a, b = pcall(function()
+    local callOk, a, b = pcall(function()
         return trans.transferFluid(
             fromSide,
             toSide,
             amount,
-            tank
+            sourceTank
         )
     end)
 
-    if not ok then
-        print("[流体转运失败] " .. tostring(a))
+    if not callOk then
+        print(
+            "[转运异常] "
+            .. tostring(a)
+        )
+
         return 0
     end
 
-    -- 你当前版本实际返回形式：
-    -- success, moved
-    if type(b) == "number" then
-        return b
+    --------------------------------------------------------
+    -- 常见成功：
+    -- true, moved
+    --------------------------------------------------------
+
+    if a == true then
+        local moved =
+            tonumber(b)
+
+        if moved then
+            return moved
+        end
+
+        print(
+            "[转运失败] 返回移动量异常: "
+            .. tostring(b)
+        )
+
+        return 0
     end
 
-    -- 兼容直接返回移动量的版本
+    --------------------------------------------------------
+    -- 常见失败：
+    -- nil/false, "reason"
+    --------------------------------------------------------
+
+    if a == nil
+        or a == false
+    then
+
+        if b ~= nil then
+            print(
+                "[转运失败] "
+                .. tostring(b)
+            )
+        end
+
+        return 0
+    end
+
+    --------------------------------------------------------
+    -- 兼容某些版本直接返回number
+    --------------------------------------------------------
+
     if type(a) == "number" then
         return a
     end
 
+    if type(b) == "number" then
+        return b
+    end
+
+    print(
+        "[转运失败] 未知返回值: "
+        .. tostring(a)
+        .. ", "
+        .. tostring(b)
+    )
+
     return 0
 end
 
-local function transferItemSafe(fromSide, toSide, amount, slot)
+------------------------------------------------------------
+-- Safe item transfer
+------------------------------------------------------------
+
+local function transferItemSafe(
+    fromSide,
+    toSide,
+    amount,
+    slot
+)
     amount = math.floor(toNumber(amount))
 
     if amount <= 0 then
         return 0
     end
 
-    local ok, moved = pcall(function()
+    local callOk, a, b = pcall(function()
         return trans.transferItem(
             fromSide,
             toSide,
@@ -264,25 +329,61 @@ local function transferItemSafe(fromSide, toSide, amount, slot)
         )
     end)
 
-    if not ok then
-        print("[物品转运失败] " .. tostring(moved))
+    if not callOk then
+        print(
+            "[物品转运异常] "
+            .. tostring(a)
+        )
+
         return 0
     end
 
-    return toNumber(moved)
+    if type(a) == "number" then
+        return a
+    end
+
+    if a == true
+        and type(b) == "number"
+    then
+        return b
+    end
+
+    if a == nil
+        or a == false
+    then
+
+        if b ~= nil then
+            print(
+                "[物品转运失败] "
+                .. tostring(b)
+            )
+        end
+
+        return 0
+    end
+
+    return tonumber(b) or 0
 end
 
 ------------------------------------------------------------
--- Ordinary fluid -> plasma name
+-- Fluid -> plasma name
 ------------------------------------------------------------
 
-local function fluidToPlasma(fluidName)
+local function fluidToPlasma(
+    fluidName
+)
     if not fluidName then
         return nil
     end
 
-    if fluidName:match("^molten%.") then
-        local mat = fluidName:match("^molten%.(.+)$")
+    if fluidName:match(
+        "^molten%."
+    )
+    then
+        local mat =
+            fluidName:match(
+                "^molten%.(.+)$"
+            )
 
         if mat then
             return "plasma." .. mat
@@ -293,7 +394,7 @@ local function fluidToPlasma(fluidName)
 end
 
 ------------------------------------------------------------
--- Dust item -> plasma name
+-- Item -> plasma name
 ------------------------------------------------------------
 
 local function itemToPlasma(item)
@@ -302,27 +403,41 @@ local function itemToPlasma(item)
     end
 
     --------------------------------------------------------
-    -- GregTech standard dust
+    -- GregTech
     --------------------------------------------------------
 
-    if item.name == "gregtech:gt.metaitem.01" then
+    if item.name
+        == "gregtech:gt.metaitem.01"
+    then
+
         local override =
-            gtDustPlasmaOverride[item.damage]
+            gtDustPlasmaOverride[
+                item.damage
+            ]
 
         if override then
             return "plasma." .. override
         end
 
-        local label = item.label or ""
-        local mat = label:match("^(.+) Dust$")
+        local label =
+            item.label or ""
+
+        local mat =
+            label:match(
+                "^(.+) Dust$"
+            )
 
         if not mat then
             return nil
         end
 
-        mat = string.lower(
-            mat:gsub(" ", "")
-        )
+        mat =
+            string.lower(
+                mat:gsub(
+                    " ",
+                    ""
+                )
+            )
 
         return "plasma." .. mat
     end
@@ -331,14 +446,20 @@ local function itemToPlasma(item)
     -- BartWorks
     --------------------------------------------------------
 
-    if item.name == "bartworks:gt.bwMetaGenerateddust" then
-        local mat = bartMaterial[item.damage]
+    if item.name
+        == "bartworks:gt.bwMetaGenerateddust"
+    then
 
-        if not mat then
-            return nil
+        local mat =
+            bartMaterial[
+                item.damage
+            ]
+
+        if mat then
+            return "plasma." .. mat
         end
 
-        return "plasma." .. mat
+        return nil
     end
 
     --------------------------------------------------------
@@ -346,35 +467,41 @@ local function itemToPlasma(item)
     --------------------------------------------------------
 
     if item.name
-        and item.name:match("^miscutils:itemDust")
+        and item.name:match(
+            "^miscutils:itemDust"
+        )
     then
+
         local mat =
             item.name:match(
                 "^miscutils:itemDust(.+)$"
             )
 
-        if not mat then
-            return nil
+        if mat then
+            return
+                "plasma."
+                .. string.lower(mat)
         end
-
-        return "plasma." .. string.lower(mat)
     end
 
     return nil
 end
 
 ------------------------------------------------------------
--- Scan current QGP indicators
+-- Scan QGP indicators
 ------------------------------------------------------------
 
-local function scanCacheBuffer(verbose)
+local function scanCacheBuffer(
+    verbose
+)
     plasmaDemands = {}
 
     --------------------------------------------------------
-    -- Fluid indicators
+    -- Fluids
     --------------------------------------------------------
 
     for i = 1, 7 do
+
         local fluid =
             getFluid(
                 sideCacheBuffer,
@@ -382,39 +509,54 @@ local function scanCacheBuffer(verbose)
             )
 
         if fluid then
+
             local amount =
-                toNumber(fluid.amount)
+                toNumber(
+                    fluid.amount
+                )
 
             local name =
-                tostring(fluid.name or "")
+                tostring(
+                    fluid.name or ""
+                )
 
             if amount > 0
-                and amount <= INDICATOR_FLUID_MAX
-                and not name:match("^plasma%.")
+                and amount
+                    <= INDICATOR_FLUID_MAX
+                and not name:match(
+                    "^plasma%."
+                )
             then
+
                 local plasmaName =
-                    fluidToPlasma(name)
+                    fluidToPlasma(
+                        name
+                    )
 
                 if plasmaName then
+
                     local need =
-                        amount * FLUID_TO_PLASMA
+                        amount
+                        * FLUID_TO_PLASMA
 
                     table.insert(
                         plasmaDemands,
                         {
-                            name = plasmaName,
-                            amount = need,
-                            sourceType = "fluid",
-                            sourceIndex = i,
-                            sourceName = name
+                            name =
+                                plasmaName,
+
+                            amount =
+                                need
                         }
                     )
 
                     if verbose then
+
                         print(
                             string.format(
                                 "流体 %s -> %s × %d mB",
-                                fluid.label or name,
+                                fluid.label
+                                    or name,
                                 plasmaName,
                                 need
                             )
@@ -426,10 +568,11 @@ local function scanCacheBuffer(verbose)
     end
 
     --------------------------------------------------------
-    -- Dust indicators
+    -- Dusts
     --------------------------------------------------------
 
     for i = 1, 7 do
+
         local item =
             getItem(
                 sideCacheBuffer,
@@ -437,45 +580,59 @@ local function scanCacheBuffer(verbose)
             )
 
         if item then
+
             local plasmaName =
-                itemToPlasma(item)
+                itemToPlasma(
+                    item
+                )
 
             if plasmaName then
+
                 local count =
-                    toNumber(item.size)
+                    toNumber(
+                        item.size
+                    )
 
                 local need =
-                    count * DUST_TO_PLASMA
+                    count
+                    * DUST_TO_PLASMA
 
                 table.insert(
                     plasmaDemands,
                     {
-                        name = plasmaName,
-                        amount = need,
-                        sourceType = "item",
-                        sourceIndex = i,
-                        sourceName = item.name
+                        name =
+                            plasmaName,
+
+                        amount =
+                            need
                     }
                 )
 
                 if verbose then
+
                     print(
                         string.format(
                             "物品 %s -> %s × %d mB",
-                            item.label or item.name,
+                            item.label
+                                or item.name,
                             plasmaName,
                             need
                         )
                     )
                 end
+
             elseif verbose then
+
                 print(
                     "[无法识别物品] "
                     .. tostring(
-                        item.label or item.name
+                        item.label
+                            or item.name
                     )
                     .. " damage="
-                    .. tostring(item.damage)
+                    .. tostring(
+                        item.damage
+                    )
                 )
             end
         end
@@ -485,17 +642,13 @@ local function scanCacheBuffer(verbose)
 end
 
 ------------------------------------------------------------
--- Ensure cache currently contains indicator material only
---
--- 防止最终QGP产物或者仍未消费的plasma被误送进物质聚合器。
+-- Validate cache before deleting indicators
 ------------------------------------------------------------
 
 local function validateIndicatorCache()
-    --------------------------------------------------------
-    -- Fluids
-    --------------------------------------------------------
 
     for i = 1, 7 do
+
         local fluid =
             getFluid(
                 sideCacheBuffer,
@@ -503,39 +656,54 @@ local function validateIndicatorCache()
             )
 
         if fluid
-            and toNumber(fluid.amount) > 0
+            and toNumber(
+                fluid.amount
+            ) > 0
         then
+
             local amount =
-                toNumber(fluid.amount)
+                toNumber(
+                    fluid.amount
+                )
 
             local name =
-                tostring(fluid.name or "")
+                tostring(
+                    fluid.name or ""
+                )
 
-            if name:match("^plasma%.") then
+            if name:match(
+                "^plasma%."
+            )
+            then
+
                 return false,
                     "缓存仓中仍有等离子体: "
                     .. name
                     .. " × "
-                    .. tostring(amount)
+                    .. tostring(
+                        amount
+                    )
                     .. " mB"
             end
 
-            if amount > INDICATOR_FLUID_MAX then
+            if amount
+                > INDICATOR_FLUID_MAX
+            then
+
                 return false,
                     "缓存仓出现非指示大流体: "
                     .. name
                     .. " × "
-                    .. tostring(amount)
+                    .. tostring(
+                        amount
+                    )
                     .. " mB"
             end
         end
     end
 
-    --------------------------------------------------------
-    -- Items
-    --------------------------------------------------------
-
     for i = 1, 7 do
+
         local item =
             getItem(
                 sideCacheBuffer,
@@ -543,12 +711,16 @@ local function validateIndicatorCache()
             )
 
         if item
-            and not itemToPlasma(item)
+            and not itemToPlasma(
+                item
+            )
         then
+
             return false,
                 "缓存仓出现未知物品: "
                 .. tostring(
-                    item.label or item.name
+                    item.label
+                        or item.name
                 )
         end
     end
@@ -557,20 +729,17 @@ local function validateIndicatorCache()
 end
 
 ------------------------------------------------------------
--- Clear current seven indicator materials
---
--- 只在确认：
---   1. 完整识别7种需求
---   2. 缓存仓里没有plasma/QGP异常流体
--- 后才执行。
+-- Clear current QGP indicator materials
 ------------------------------------------------------------
 
 local function clearCacheBuffer()
+
     --------------------------------------------------------
     -- Fluids
     --------------------------------------------------------
 
     for i = 1, 7 do
+
         local fluid =
             getFluid(
                 sideCacheBuffer,
@@ -578,10 +747,15 @@ local function clearCacheBuffer()
             )
 
         if fluid
-            and toNumber(fluid.amount) > 0
+            and toNumber(
+                fluid.amount
+            ) > 0
         then
+
             local expected =
-                toNumber(fluid.amount)
+                toNumber(
+                    fluid.amount
+                )
 
             local moved =
                 transferFluidSafe(
@@ -592,10 +766,13 @@ local function clearCacheBuffer()
                 )
 
             if moved < expected then
+
                 print(
                     string.format(
                         "[清理失败] %s 期望 %d，实际 %d",
-                        tostring(fluid.name),
+                        tostring(
+                            fluid.name
+                        ),
                         expected,
                         moved
                     )
@@ -611,6 +788,7 @@ local function clearCacheBuffer()
     --------------------------------------------------------
 
     for i = 1, 7 do
+
         local item =
             getItem(
                 sideCacheBuffer,
@@ -618,8 +796,11 @@ local function clearCacheBuffer()
             )
 
         if item then
+
             local expected =
-                toNumber(item.size)
+                toNumber(
+                    item.size
+                )
 
             local moved =
                 transferItemSafe(
@@ -630,11 +811,13 @@ local function clearCacheBuffer()
                 )
 
             if moved < expected then
+
                 print(
                     string.format(
                         "[清理失败] %s 期望 %d，实际 %d",
                         tostring(
-                            item.label or item.name
+                            item.label
+                                or item.name
                         ),
                         expected,
                         moved
@@ -653,24 +836,35 @@ end
 -- Fluid Interface filter
 ------------------------------------------------------------
 
-local function setFluidFilter(fluidName)
+local function setFluidFilter(
+    fluidName
+)
     local ok, err =
         pcall(function()
-            fInterface.setFluidInterfaceConfiguration(
-                0,
-                {
-                    name = fluidName
-                }
-            )
+
+            fInterface
+                .setFluidInterfaceConfiguration(
+                    0,
+                    {
+                        name =
+                            fluidName
+                    }
+                )
         end)
 
     if not ok then
+
         print(
             "[接口] 设置过滤器失败: "
-            .. tostring(fluidName)
+            .. tostring(
+                fluidName
+            )
+            .. " ("
+            .. tostring(
+                err
+            )
+            .. ")"
         )
-
-        print(tostring(err))
 
         return false
     end
@@ -679,429 +873,331 @@ local function setFluidFilter(fluidName)
 end
 
 local function clearFluidFilter()
+
     pcall(function()
-        fInterface.setFluidInterfaceConfiguration(0)
-    end)
-end
 
-------------------------------------------------------------
--- AE Craftable handling
---
--- 关键：
--- Craftable是OC AbstractValue/userdata，
--- 不能要求type(value)必须是table。
-------------------------------------------------------------
-------------------------------------------------------------
--- AE Craftable helpers
-------------------------------------------------------------
-
-local function pack(...)
-    return {
-        n = select("#", ...),
-        ...
-    }
-end
-
-local function hasMethod(obj, methodName)
-    if obj == nil then
-        return false
-    end
-
-    local ok, method = pcall(function()
-        return obj[methodName]
-    end)
-
-    return ok and type(method) == "function"
-end
-
-------------------------------------------------------------
--- 检查一个对象是不是目标 Craftable
-------------------------------------------------------------
-
-local function isTargetCraftable(obj, plasmaName)
-
-    if obj == nil then
-        return false
-    end
-
-    if not hasMethod(obj, "request") then
-        return false
-    end
-
-    if not hasMethod(obj, "getStack") then
-        return false
-    end
-
-    local ok, stack = pcall(function()
-        return obj.getStack()
-    end)
-
-    if not ok or stack == nil then
-        return false
-    end
-
-    local name = nil
-
-    local okName = pcall(function()
-        name = stack.name
-    end)
-
-    if not okName then
-        return false
-    end
-
-    return name == plasmaName
-end
-
-------------------------------------------------------------
--- 递归扫描 getCraftables 返回值
-------------------------------------------------------------
-
-local function searchCraftable(value, plasmaName, depth)
-
-    depth = depth or 0
-
-    if depth > 5 or value == nil then
-        return nil
-    end
-
-    --------------------------------------------------------
-    -- value 本身就是 Craftable userdata
-    --------------------------------------------------------
-
-    if isTargetCraftable(
-        value,
-        plasmaName
-    ) then
-        return value
-    end
-
-    --------------------------------------------------------
-    -- 不是 table 就没法继续向下找
-    --------------------------------------------------------
-
-    if type(value) ~= "table" then
-        return nil
-    end
-
-    --------------------------------------------------------
-    -- 遍历容器
-    --------------------------------------------------------
-
-    for _, child in pairs(value) do
-
-        local found =
-            searchCraftable(
-                child,
-                plasmaName,
-                depth + 1
-            )
-
-        if found then
-            return found
-        end
-    end
-
-    return nil
-end
-
-------------------------------------------------------------
--- 获取指定 plasma 的 Craftable
-------------------------------------------------------------
-
-local function getCraftable(plasmaName)
-
-    --------------------------------------------------------
-    -- 方法1：
-    -- 新版 GTNH OC 有 getCraftable(detail, type)
-    --------------------------------------------------------
-
-    if type(fInterface.getCraftable)
-        == "function"
-    then
-
-        local ok, craftable =
-            pcall(function()
-
-                return
-                    fInterface.getCraftable(
-                        {
-                            name = plasmaName
-                        },
-                        "fluid"
-                    )
-            end)
-
-        if ok
-            and craftable
-            and hasMethod(
-                craftable,
-                "request"
-            )
-        then
-
-            print(
-                "[下单] 精确找到配方: "
-                .. plasmaName
-            )
-
-            return craftable
-        end
-    end
-
-    --------------------------------------------------------
-    -- 方法2：
-    -- 兼容2.9b1：
-    --
-    -- 不使用过滤器。
-    -- 直接读取全部可合成项，然后通过 getStack()
-    -- 检查每一个 Craftable 的真实输出。
-    --------------------------------------------------------
-
-    local result =
-        pack(
-            pcall(function()
-
-                return
-                    fInterface.getCraftables()
-            end)
-        )
-
-    --------------------------------------------------------
-    -- pcall第一个返回值
-    --------------------------------------------------------
-
-    if not result[1] then
-
-        print(
-            "[下单] getCraftables异常: "
-            .. tostring(result[2])
-        )
-
-        return nil
-    end
-
-    --------------------------------------------------------
-    -- pcall后面的所有返回值都检查
-    --
-    -- 这么写同时兼容：
-    --
-    -- getCraftables() -> table
-    --
-    -- 和某些版本可能出现的：
-    --
-    -- getCraftables() -> value1,value2,...
-    --------------------------------------------------------
-
-    for i = 2, result.n do
-
-        local found =
-            searchCraftable(
-                result[i],
-                plasmaName,
+        fInterface
+            .setFluidInterfaceConfiguration(
                 0
             )
+    end)
+end
 
-        if found then
+------------------------------------------------------------
+-- AE crafting request
+--
+-- amount就是最终仍缺少的plasma数量。
+--
+-- 不识别样板倍率。
+-- 不计算配方次数。
+-- 直接交给AE crafting planner。
+------------------------------------------------------------
 
-            print(
-                "[下单] 扫描找到配方: "
-                .. plasmaName
+local function requestPlasmaSynthesis(
+    plasmaName,
+    amount
+)
+    amount =
+        math.floor(
+            tonumber(
+                amount
             )
+            or 1
+        )
 
-            return found
-        end
+    if amount < 1 then
+        amount = 1
+    end
+
+    if amount
+        > MAX_REQUEST_AMOUNT
+    then
+        amount =
+            MAX_REQUEST_AMOUNT
     end
 
     print(
-        "[下单] AE中没有找到目标Craftable: "
+        "[下单] 查找: "
         .. plasmaName
+        .. " × "
+        .. tostring(
+            amount
+        )
+        .. " mB"
     )
 
-    return nil
-end
-
-
     --------------------------------------------------------
-    -- 正常GTNH：
-    -- 外层是table，里面是Craftable userdata。
-    --
-    -- 同时递归处理，避免版本返回结构差异。
+    -- 已经验证可用的查询方式
     --------------------------------------------------------
 
-    local craftable =
-        findRequestObject(
-            craftables,
-            0
+    local ok, craftables =
+        pcall(function()
+
+            return
+                fInterface.getCraftables(
+                    {
+                        name =
+                            plasmaName
+                    }
+                )
+        end)
+
+    if not ok then
+
+        print(
+            "[下单] 查询失败: "
+            .. tostring(
+                craftables
+            )
         )
 
-    if not craftable then
+        return nil
+    end
+
+    if type(craftables)
+        ~= "table"
+        or not craftables[1]
+    then
+
         print(
-            "[下单] AE中没有可请求配方: "
+            "[下单] 未找到配方: "
             .. plasmaName
         )
 
         return nil
     end
 
-    return craftable
-end
+    print(
+        "[下单] 找到配方，开始计算..."
+    )
 
-------------------------------------------------------------
--- Submit AE crafting request
---
--- remaining就是最终仍缺少的目标等离子数量。
---
--- 不计算：
---   样板输出倍率
---   配方执行次数
---
--- 直接把最终需求交给AE。
-------------------------------------------------------------
+    --------------------------------------------------------
+    -- 直接请求当前缺口
+    --------------------------------------------------------
 
-local function requestPlasmaSynthesis(
-    plasmaName,
-    remaining
-)
-    remaining =
-        math.floor(
-            toNumber(remaining)
+    local reqOk, status =
+        pcall(function()
+
+            return
+                craftables[1]
+                    .request(
+                        amount,
+                        true
+                    )
+        end)
+
+    if not reqOk then
+
+        print(
+            "[下单] request异常: "
+            .. tostring(
+                status
+            )
         )
 
-    if remaining <= 0 then
         return nil
+    end
+
+    if not status then
+
+        print(
+            "[下单] 没有任务对象"
+        )
+
+        return nil
+    end
+
+    --------------------------------------------------------
+    -- 等AE真正完成crafting plan
+    --------------------------------------------------------
+
+    for i = 1,
+        CRAFT_PLAN_TIMEOUT
+    do
+
+        local okDone,
+            done,
+            doneInfo =
+            pcall(function()
+
+                return
+                    status.isDone()
+            end)
+
+        local okCancel,
+            canceled,
+            cancelInfo =
+            pcall(function()
+
+                return
+                    status.isCanceled()
+            end)
+
+        if okCancel
+            and canceled
+        then
+
+            print(
+                "[下单] 请求失败/取消: "
+                .. tostring(
+                    cancelInfo
+                )
+            )
+
+            return nil
+        end
+
+        local computing =
+            (
+                okDone
+                and doneInfo
+                    == "computing"
+            )
+            or
+            (
+                okCancel
+                and cancelInfo
+                    == "computing"
+            )
+
+        ----------------------------------------------------
+        -- 不再处于computing阶段
+        ----------------------------------------------------
+
+        if not computing then
+
+            if okDone
+                and done
+            then
+
+                print(
+                    "[下单] 任务已快速完成: "
+                    .. plasmaName
+                )
+
+            else
+
+                print(
+                    "[下单] 已真正提交到CPU: "
+                    .. plasmaName
+                    .. " × "
+                    .. tostring(
+                        amount
+                    )
+                    .. " mB"
+                )
+            end
+
+            return status
+        end
+
+        if i % 5 == 0 then
+
+            print(
+                "[下单] AE正在计算配方... "
+                .. tostring(i)
+                .. "s"
+            )
+        end
+
+        os.sleep(1)
     end
 
     print(
-        string.format(
-            "[下单] AE请求 %s × %d mB",
-            plasmaName,
-            remaining
-        )
+        "[下单] 配方计算超时"
     )
 
-    local craftable =
-        getCraftable(plasmaName)
-
-    if not craftable then
-        return nil
-    end
-
-    local ok, status =
-        pcall(function()
-            return craftable.request(
-                remaining,
-                true
-            )
-        end)
-
-    if not ok then
-        print(
-            "[下单] request失败: "
-            .. tostring(status)
-        )
-
-        return nil
-    end
-
-    if status == nil then
-        print(
-            "[下单] AE没有返回任务对象"
-        )
-
-        return nil
-    end
-
-    print("[下单] 请求已提交")
-
-    return status
+    return nil
 end
 
 ------------------------------------------------------------
--- CraftingStatus
---
--- return:
---   computing
---   running
---   done
---   failed
---   canceled
---   unknown
+-- Check AE task state
 ------------------------------------------------------------
 
-local function getCraftState(status)
-    if status == nil then
-        return "unknown"
+local function getCraftState(
+    status
+)
+    if not status then
+        return "none"
     end
 
-    --------------------------------------------------------
-    -- AE still calculating crafting plan
-    --------------------------------------------------------
-
-    local okComputing, computing =
+    local okCancel,
+        canceled,
+        cancelInfo =
         pcall(function()
-            return status.isComputing()
+
+            return
+                status.isCanceled()
         end)
 
-    if okComputing and computing then
-        return "computing"
+    if okCancel
+        and canceled
+    then
+
+        return
+            "canceled",
+            cancelInfo
     end
 
-    --------------------------------------------------------
-    -- Failed
-    --------------------------------------------------------
-
-    local okFailed, failed, failReason =
+    local okDone,
+        done,
+        doneInfo =
         pcall(function()
-            return status.hasFailed()
-        end)
 
-    if okFailed and failed then
-        return "failed", failReason
-    end
-
-    --------------------------------------------------------
-    -- Canceled
-    --------------------------------------------------------
-
-    local okCanceled, canceled, cancelReason =
-        pcall(function()
-            return status.isCanceled()
-        end)
-
-    if okCanceled and canceled then
-        return "canceled", cancelReason
-    end
-
-    --------------------------------------------------------
-    -- Done / running
-    --------------------------------------------------------
-
-    local okDone, done, doneReason =
-        pcall(function()
-            return status.isDone()
+            return
+                status.isDone()
         end)
 
     if okDone then
-        if done then
-            return "done", doneReason
+
+        if doneInfo
+            == "computing"
+        then
+
+            return
+                "computing",
+                doneInfo
         end
 
-        return "running", doneReason
+        if done then
+
+            return
+                "done",
+                doneInfo
+        end
+
+        return
+            "running",
+            doneInfo
+    end
+
+    if okCancel
+        and cancelInfo
+            == "computing"
+    then
+
+        return
+            "computing",
+            cancelInfo
     end
 
     return "unknown"
 end
 
 ------------------------------------------------------------
--- Feed one complete QGP round
+-- Process all seven plasma requirements
 ------------------------------------------------------------
 
 local function processPlasmaDemands()
+
     for index, demand
-        in ipairs(plasmaDemands)
+        in ipairs(
+            plasmaDemands
+        )
     do
+
         print("")
+
         print(
             string.format(
                 ">>> %d/%d: %s，需要 %d mB",
@@ -1113,11 +1209,16 @@ local function processPlasmaDemands()
         )
 
         ----------------------------------------------------
-        -- Select plasma on Fluid Interface
+        -- Select target plasma
         ----------------------------------------------------
 
-        if not setFluidFilter(demand.name) then
+        if not setFluidFilter(
+            demand.name
+        )
+        then
+
             clearFluidFilter()
+
             return false
         end
 
@@ -1125,18 +1226,26 @@ local function processPlasmaDemands()
 
         local remaining =
             math.floor(
-                toNumber(demand.amount)
+                toNumber(
+                    demand.amount
+                )
             )
 
-        local craftStatus = nil
-        local craftDoneAt = nil
-        local lastStatusPrint = 0
+        local craftStatus =
+            nil
+
+        local craftDoneAt =
+            nil
+
+        local lastStatusPrint =
+            0
 
         ----------------------------------------------------
-        -- Continue until exact amount has been injected
+        -- Feed until exact requirement is satisfied
         ----------------------------------------------------
 
         while remaining > 0 do
+
             local fluid =
                 getFluid(
                     sideInterface,
@@ -1147,25 +1256,35 @@ local function processPlasmaDemands()
             local fluidName = nil
 
             if fluid then
+
                 available =
-                    toNumber(fluid.amount)
+                    toNumber(
+                        fluid.amount
+                    )
 
                 fluidName =
                     fluid.name
             end
 
             ------------------------------------------------
-            -- Target plasma available
+            -- Correct target plasma available
             ------------------------------------------------
 
             if available > 0
-                and fluidName == demand.name
+                and fluidName
+                    == demand.name
             then
+
                 local take =
                     math.min(
                         remaining,
                         available
                     )
+
+                ------------------------------------------------
+                -- 关键：
+                -- 这里不再直接读取第二返回值然后和0比较。
+                ------------------------------------------------
 
                 local moved =
                     transferFluidSafe(
@@ -1176,6 +1295,7 @@ local function processPlasmaDemands()
                     )
 
                 if moved > 0 then
+
                     remaining =
                         remaining - moved
 
@@ -1185,53 +1305,64 @@ local function processPlasmaDemands()
 
                     print(
                         string.format(
-                            "已抽取 %d mB，剩余 %d mB",
+                            "已抽取 %d mB，剩余需求 %d mB",
                             moved,
                             remaining
                         )
                     )
 
                     os.sleep(0.1)
+
                 else
+
                     os.sleep(0.5)
                 end
 
             ------------------------------------------------
-            -- Interface still exposing previous fluid
+            -- Interface currently exposes previous fluid
             ------------------------------------------------
 
             elseif available > 0
                 and fluidName
-                and fluidName ~= demand.name
+                and fluidName
+                    ~= demand.name
             then
+
                 local now =
                     computer.uptime()
 
-                if now - lastStatusPrint
+                if now
+                    - lastStatusPrint
                     >= STATUS_PRINT_INTERVAL
                 then
+
                     print(
                         "[接口] 当前为 "
-                        .. tostring(fluidName)
+                        .. tostring(
+                            fluidName
+                        )
                         .. "，等待 "
                         .. demand.name
                     )
 
-                    lastStatusPrint = now
+                    lastStatusPrint =
+                        now
                 end
 
                 os.sleep(0.5)
 
             ------------------------------------------------
-            -- No target plasma currently available
+            -- Interface has no target plasma
             ------------------------------------------------
 
             else
+
                 ------------------------------------------------
-                -- No active/requested job
+                -- No active request
                 ------------------------------------------------
 
-                if craftStatus == nil then
+                if not craftStatus then
+
                     print(
                         "接口无目标流体，尝试下单..."
                     )
@@ -1242,24 +1373,30 @@ local function processPlasmaDemands()
                             remaining
                         )
 
-                    craftDoneAt = nil
+                    craftDoneAt =
+                        nil
 
                     if not craftStatus then
+
                         print(
                             "[下单] 本次失败，5秒后重试"
                         )
 
                         os.sleep(5)
+
                     else
+
                         os.sleep(0.5)
                     end
 
                 ------------------------------------------------
-                -- Existing request
+                -- Existing AE request
                 ------------------------------------------------
 
                 else
-                    local state, reason =
+
+                    local state,
+                        reason =
                         getCraftState(
                             craftStatus
                         )
@@ -1268,30 +1405,41 @@ local function processPlasmaDemands()
                         computer.uptime()
 
                     --------------------------------------------
-                    -- AE calculating plan
+                    -- Still calculating
                     --------------------------------------------
 
-                    if state == "computing" then
-                        if now - lastStatusPrint
+                    if state
+                        == "computing"
+                    then
+
+                        if now
+                            - lastStatusPrint
                             >= STATUS_PRINT_INTERVAL
                         then
+
                             print(
                                 "[AE] 正在计算合成计划..."
                             )
 
-                            lastStatusPrint = now
+                            lastStatusPrint =
+                                now
                         end
 
                         os.sleep(0.5)
 
                     --------------------------------------------
-                    -- CPU running
+                    -- CPU is working
                     --------------------------------------------
 
-                    elseif state == "running" then
-                        if now - lastStatusPrint
+                    elseif state
+                        == "running"
+                    then
+
+                        if now
+                            - lastStatusPrint
                             >= STATUS_PRINT_INTERVAL
                         then
+
                             print(
                                 string.format(
                                     "[AE] 合成中，仍需 %d mB",
@@ -1299,63 +1447,73 @@ local function processPlasmaDemands()
                                 )
                             )
 
-                            lastStatusPrint = now
+                            lastStatusPrint =
+                                now
                         end
 
                         os.sleep(0.5)
 
                     --------------------------------------------
-                    -- Job done
+                    -- Task completed
                     --------------------------------------------
 
-                    elseif state == "done" then
+                    elseif state
+                        == "done"
+                    then
+
                         if not craftDoneAt then
-                            craftDoneAt = now
+
+                            craftDoneAt =
+                                now
 
                             print(
                                 "[AE] 合成任务完成，等待接口刷新..."
                             )
                         end
 
-                        if now - craftDoneAt
+                        if now
+                            - craftDoneAt
                             >= CRAFT_DONE_GRACE
                         then
-                            ------------------------------------------------
-                            -- AE任务已经结束，
-                            -- 但过了缓冲时间仍然缺目标流体。
-                            --
-                            -- 按当前剩余量重新补单。
-                            ------------------------------------------------
 
                             print(
                                 string.format(
-                                    "[AE] 仍缺 %d mB，重新补单",
+                                    "[AE] 任务结束后仍缺 %d mB，重新补单",
                                     remaining
                                 )
                             )
 
-                            craftStatus = nil
-                            craftDoneAt = nil
+                            craftStatus =
+                                nil
+
+                            craftDoneAt =
+                                nil
+
                         else
+
                             os.sleep(0.5)
                         end
 
                     --------------------------------------------
-                    -- Failed / canceled
+                    -- Canceled
                     --------------------------------------------
 
-                    elseif state == "failed"
-                        or state == "canceled"
+                    elseif state
+                        == "canceled"
                     then
+
                         print(
-                            "[AE] 任务 "
-                            .. state
-                            .. ": "
-                            .. tostring(reason)
+                            "[AE] 任务已取消: "
+                            .. tostring(
+                                reason
+                            )
                         )
 
-                        craftStatus = nil
-                        craftDoneAt = nil
+                        craftStatus =
+                            nil
+
+                        craftDoneAt =
+                            nil
 
                         os.sleep(2)
 
@@ -1364,18 +1522,21 @@ local function processPlasmaDemands()
                     --------------------------------------------
 
                     else
-                        if now - lastStatusPrint
+
+                        if now
+                            - lastStatusPrint
                             >= STATUS_PRINT_INTERVAL
                         then
+
                             print(
                                 "[AE] 无法读取任务状态，继续等待..."
                             )
 
-                            lastStatusPrint = now
+                            lastStatusPrint =
+                                now
                         end
 
-                        -- unknown时不重复下单，
-                        -- 防止已有CPU任务时造成重复请求。
+                        -- 不重复下单
                         os.sleep(1)
                     end
                 end
@@ -1383,7 +1544,7 @@ local function processPlasmaDemands()
         end
 
         ----------------------------------------------------
-        -- Current plasma complete
+        -- Current plasma done
         ----------------------------------------------------
 
         print(
@@ -1396,36 +1557,48 @@ local function processPlasmaDemands()
         os.sleep(0.5)
     end
 
+    --------------------------------------------------------
+    -- Entire round complete
+    --------------------------------------------------------
+
     clearFluidFilter()
 
     print("")
-    print("========================================")
-    print("本轮7种等离子体输入完成")
-    print("等待异化器生成下一轮指示材料")
-    print("========================================")
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "本轮7种等离子体全部输入完成"
+    )
+
+    print(
+        "等待异化器生成下一轮指示材料"
+    )
+
+    print(
+        "========================================"
+    )
+
     print("")
 
     --------------------------------------------------------
     -- 注意：
-    --
-    -- 此处绝对不清缓存仓。
-    --
-    -- 送入的大量等离子体必须让异化器自己消费。
+    -- 此处绝对不能clearCacheBuffer()
     --------------------------------------------------------
 
     return true
 end
 
 ------------------------------------------------------------
--- Detect whether a new round is appearing
+-- Detect potential new QGP round
 ------------------------------------------------------------
 
 local function hasPotentialIndicators()
-    --------------------------------------------------------
-    -- Fluid indicators
-    --------------------------------------------------------
 
     for i = 1, 7 do
+
         local fluid =
             getFluid(
                 sideCacheBuffer,
@@ -1433,26 +1606,32 @@ local function hasPotentialIndicators()
             )
 
         if fluid then
+
             local amount =
-                toNumber(fluid.amount)
+                toNumber(
+                    fluid.amount
+                )
 
             local name =
-                tostring(fluid.name or "")
+                tostring(
+                    fluid.name or ""
+                )
 
             if amount > 0
-                and amount <= INDICATOR_FLUID_MAX
-                and not name:match("^plasma%.")
+                and amount
+                    <= INDICATOR_FLUID_MAX
+                and not name:match(
+                    "^plasma%."
+                )
             then
+
                 return true
             end
         end
     end
 
-    --------------------------------------------------------
-    -- Recognized dust indicators
-    --------------------------------------------------------
-
     for i = 1, 7 do
+
         local item =
             getItem(
                 sideCacheBuffer,
@@ -1460,8 +1639,11 @@ local function hasPotentialIndicators()
             )
 
         if item
-            and itemToPlasma(item)
+            and itemToPlasma(
+                item
+            )
         then
+
             return true
         end
     end
@@ -1474,35 +1656,47 @@ end
 ------------------------------------------------------------
 
 local function waitIfMachineDisabled()
+
     if not gtm then
         return
     end
 
     local ok, allowed =
         pcall(function()
-            return gtm.isWorkAllowed()
+
+            return
+                gtm.isWorkAllowed()
         end)
 
-    if not ok then
+    if not ok
+        or allowed
+    then
         return
     end
 
-    if allowed then
-        return
-    end
-
-    print("机器已关闭，等待重新启动...")
+    print(
+        "机器已关闭，等待重新启动..."
+    )
 
     while true do
+
         os.sleep(5)
 
         local ok2, state =
             pcall(function()
-                return gtm.isWorkAllowed()
+
+                return
+                    gtm.isWorkAllowed()
             end)
 
-        if ok2 and state then
-            print("机器已重新启动")
+        if ok2
+            and state
+        then
+
+            print(
+                "机器已重新启动"
+            )
+
             return
         end
     end
@@ -1513,6 +1707,7 @@ end
 ------------------------------------------------------------
 
 local function main()
+
     clearScreen()
 
     --------------------------------------------------------
@@ -1520,83 +1715,119 @@ local function main()
     --------------------------------------------------------
 
     if not trans then
-        print("错误：未找到 transposer")
+
+        print(
+            "错误：未找到 transposer"
+        )
+
         return
     end
 
     if not fInterface then
-        print("错误：未找到 fluid_interface")
+
+        print(
+            "错误：未找到 fluid_interface"
+        )
+
         return
     end
 
-    print("组件检查通过")
-    print("")
-    print("缓存仓方向 : DOWN")
-    print("物质聚合器 : SOUTH")
-    print("Fluid接口  : EAST")
-    print("")
-    print("等待QGP新一轮指示材料...")
+    print(
+        "组件检查通过"
+    )
+
     print("")
 
-    local lastPartialCount = -1
+    print(
+        "缓存仓方向 : DOWN"
+    )
+
+    print(
+        "物质聚合器 : SOUTH"
+    )
+
+    print(
+        "Fluid接口  : EAST"
+    )
+
+    print("")
+
+    print(
+        "等待QGP新一轮指示材料..."
+    )
+
+    print("")
+
+    local lastPartialCount =
+        -1
 
     --------------------------------------------------------
     -- Main loop
     --------------------------------------------------------
 
     while true do
+
         waitIfMachineDisabled()
 
-        ----------------------------------------------------
-        -- New indicator material detected
-        ----------------------------------------------------
+        if hasPotentialIndicators()
+        then
 
-        if hasPotentialIndicators() then
             ------------------------------------------------
-            -- 第一遍静默扫描
+            -- First silent scan
             ------------------------------------------------
 
             local count =
-                scanCacheBuffer(false)
+                scanCacheBuffer(
+                    false
+                )
 
             ------------------------------------------------
-            -- 完整7种
+            -- Complete 7/7 round
             ------------------------------------------------
 
-            if count == EXPECTED_DEMAND_COUNT then
+            if count
+                == EXPECTED_DEMAND_COUNT
+            then
+
                 ------------------------------------------------
-                -- 再等一小段时间，
-                -- 防止正处于输出更新瞬间。
+                -- 再等0.5秒确认输出已经稳定
                 ------------------------------------------------
 
                 os.sleep(0.5)
 
                 local count2 =
-                    scanCacheBuffer(false)
+                    scanCacheBuffer(
+                        false
+                    )
 
-                if count2 == EXPECTED_DEMAND_COUNT then
+                if count2
+                    == EXPECTED_DEMAND_COUNT
+                then
+
                     ------------------------------------------------
-                    -- 确认缓存仓没有plasma/QGP等异常内容
+                    -- Safety check
                     ------------------------------------------------
 
-                    local valid, reason =
+                    local valid,
+                        reason =
                         validateIndicatorCache()
 
                     if not valid then
+
                         print(
                             "[保护] "
-                            .. tostring(reason)
+                            .. tostring(
+                                reason
+                            )
                         )
 
                         print(
-                            "[保护] 不执行清仓，请检查输出分流。"
+                            "[保护] 不清仓，请检查输出分流。"
                         )
 
                         os.sleep(5)
+
                     else
-                        ------------------------------------------------
-                        -- 正式显示本轮
-                        ------------------------------------------------
 
                         clearScreen()
 
@@ -1606,39 +1837,44 @@ local function main()
 
                         print("")
 
-                        scanCacheBuffer(true)
+                        ------------------------------------------------
+                        -- Print complete requirements
+                        ------------------------------------------------
 
-                        print("")
-                        print(
-                            "共识别 "
-                            .. tostring(
-                                #plasmaDemands
-                            )
-                            .. "/"
-                            .. tostring(
-                                EXPECTED_DEMAND_COUNT
-                            )
-                            .. " 种需求"
+                        scanCacheBuffer(
+                            true
                         )
 
-                        ------------------------------------------------
-                        -- Clear seven indicator materials
-                        ------------------------------------------------
+                        print("")
+
+                        print(
+                            string.format(
+                                "共识别 %d/%d 种需求",
+                                #plasmaDemands,
+                                EXPECTED_DEMAND_COUNT
+                            )
+                        )
 
                         print("")
-                        print("清理本轮指示材料...")
 
-                        if not clearCacheBuffer() then
-                            print("")
+                        ------------------------------------------------
+                        -- Remove indicator materials
+                        ------------------------------------------------
+
+                        print(
+                            "清理本轮指示材料..."
+                        )
+
+                        if not clearCacheBuffer()
+                        then
+
                             print(
                                 "[严重] 指示材料未完全清理"
                             )
 
                             print(
-                                "停止本轮，避免错误输入。"
+                                "停止程序，避免错误输入。"
                             )
-
-                            clearFluidFilter()
 
                             return
                         end
@@ -1650,10 +1886,12 @@ local function main()
                         os.sleep(0.5)
 
                         ------------------------------------------------
-                        -- Feed seven plasma requirements
+                        -- Feed plasma
                         ------------------------------------------------
 
-                        if not processPlasmaDemands() then
+                        if not processPlasmaDemands()
+                        then
+
                             clearFluidFilter()
 
                             print(
@@ -1663,15 +1901,19 @@ local function main()
                             os.sleep(5)
                         end
 
-                        lastPartialCount = -1
+                        lastPartialCount =
+                            -1
                     end
                 end
 
             ------------------------------------------------
-            -- Waiting for complete set
+            -- Not all seven indicators have arrived yet
             ------------------------------------------------
 
-            elseif count ~= lastPartialCount then
+            elseif count
+                ~= lastPartialCount
+            then
+
                 print(
                     string.format(
                         "[等待] 当前识别 %d/%d 种指示材料",
@@ -1680,10 +1922,14 @@ local function main()
                     )
                 )
 
-                lastPartialCount = count
+                lastPartialCount =
+                    count
             end
+
         else
-            lastPartialCount = -1
+
+            lastPartialCount =
+                -1
         end
 
         os.sleep(1)
@@ -1701,15 +1947,28 @@ local ok, err =
     )
 
 ------------------------------------------------------------
--- Always clear Fluid Interface filter
+-- Always clear interface filter on exit/crash
 ------------------------------------------------------------
 
 clearFluidFilter()
 
 if not ok then
+
     print("")
-    print("========================================")
-    print("程序异常退出")
-    print("========================================")
-    print(tostring(err))
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "程序异常退出"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        tostring(err)
+    )
 end
