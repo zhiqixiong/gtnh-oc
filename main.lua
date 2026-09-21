@@ -15,7 +15,7 @@ local computer = require("computer")
 -- Version
 ------------------------------------------------------------
 
-local VERSION = "QGP-AUTO 0.3.0"
+local VERSION = "QGP-AUTO 0.3.1"
 
 ------------------------------------------------------------
 -- Components
