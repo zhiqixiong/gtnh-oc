@@ -1,1 +1,1 @@
-# gtnh-qgp-oc
+# gtnh-oc
