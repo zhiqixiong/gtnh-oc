@@ -4,27 +4,25 @@
 --
 -- GTNH 2.9.x / OpenComputers
 --
--- 工作流程：
+-- Hardware layout:
 --
---   1. 等待缓存仓出现：
---        - 1 个材料粉
---        - 2 种时空流体
+--   DOWN  : Large Input Cache / 大型原料缓存仓
+--   SOUTH : AE Matter Condenser / 物质聚合器
+--   EAST  : Main AE Fluid Interface
 --
---   2. 根据两种流体数量计算 plasma 需求：
+-- Magmatter round:
 --
---        abs(fluidA - fluidB) * 144
---
---   3. 粉只作为材料种类指示物，送入物质聚合器
---
---   4. 两种时空流体留在缓存仓，不清除
---
---   5. 从 AE 精确抽取所需 plasma
---
---   6. AE 不足时直接：
---
---        request(remaining, true)
---
---      样板倍率由 AE 自己处理
+--   1 dust + 2 spacetime fluids
+--          ↓
+--   identify material
+--          ↓
+--   plasmaNeed = abs(spatial - temporal) * 144
+--          ↓
+--   destroy ONLY the dust
+--          ↓
+--   keep the two spacetime fluids
+--          ↓
+--   supply exact plasma amount
 ------------------------------------------------------------
 
 local os = require("os")
@@ -37,7 +35,7 @@ local computer = require("computer")
 -- Version
 ------------------------------------------------------------
 
-local VERSION = "MAGMATTER-AUTO 0.1.0"
+local VERSION = "MAGMATTER-AUTO 0.1.1"
 
 ------------------------------------------------------------
 -- Components
@@ -48,45 +46,49 @@ local fi = component.fluid_interface
 local gtm = component.gt_machine
 
 ------------------------------------------------------------
--- Transposer sides
+-- Sides
 --
--- 当前按照你提供的磁物质源码
+-- 与QGP机器采用相同摆法
 ------------------------------------------------------------
 
--- 大型原料缓存仓
 local sideCacheBuffer = sides.down
-
--- AE物质聚合器
--- 只负责销毁材料粉
-local sideAEInfusion = sides.south
-
--- 主网 Fluid Interface
--- 用于选择和抽取目标 plasma
-local sideInterface = sides.east
+local sideAEInfusion  = sides.south
+local sideInterface   = sides.east
 
 ------------------------------------------------------------
 -- Parameters
 ------------------------------------------------------------
 
--- 两种时空流体差值 -> plasma
+-- 两种时空流体差值 × 144
 local PLASMA_MULTIPLIER = 144
 
--- AE crafting plan 最大等待时间
+-- 时间流体数量区间
+local TEMPORAL_MIN = 1
+local TEMPORAL_MAX = 50
+
+-- 空间流体数量区间
+local SPATIAL_MIN = 51
+local SPATIAL_MAX = 100
+
+-- 扫描缓存仓流体槽数量
+local MAX_FLUID_TANK_SCAN = 16
+
+-- AE crafting plan等待时间
 local CRAFT_PLAN_TIMEOUT = 60
 
--- AE任务结束以后给接口的刷新时间
+-- AE任务结束后等待接口刷新
 local CRAFT_DONE_GRACE = 3
 
 -- 日志输出间隔
 local STATUS_PRINT_INTERVAL = 5
 
--- request底层数量上限
+-- request底层整数上限
 local MAX_REQUEST_AMOUNT = 2147483647
 
 ------------------------------------------------------------
 -- GT Material Mapping
 --
--- damage -> plasma material name
+-- damage -> plasma material
 ------------------------------------------------------------
 
 local GTMaterial = {
@@ -102,14 +104,15 @@ local GTMaterial = {
 }
 
 ------------------------------------------------------------
--- Basic helpers
+-- Helpers
 ------------------------------------------------------------
 
-local function toNumber(value)
-    return tonumber(value) or 0
+local function toNumber(v)
+    return tonumber(v) or 0
 end
 
 local function clearScreen()
+
     term.clear()
     term.setCursor(1, 1)
 
@@ -121,16 +124,19 @@ local function clearScreen()
 end
 
 ------------------------------------------------------------
--- Safe fluid read
+-- Safe reads
 ------------------------------------------------------------
 
 local function getFluid(side, tank)
-    local ok, result = pcall(function()
-        return trans.getFluidInTank(
-            side,
-            tank
-        )
-    end)
+
+    local ok, result =
+        pcall(function()
+
+            return trans.getFluidInTank(
+                side,
+                tank
+            )
+        end)
 
     if not ok then
         return nil
@@ -139,17 +145,16 @@ local function getFluid(side, tank)
     return result
 end
 
-------------------------------------------------------------
--- Safe item read
-------------------------------------------------------------
-
 local function getItem(side, slot)
-    local ok, result = pcall(function()
-        return trans.getStackInSlot(
-            side,
-            slot
-        )
-    end)
+
+    local ok, result =
+        pcall(function()
+
+            return trans.getStackInSlot(
+                side,
+                slot
+            )
+        end)
 
     if not ok then
         return nil
@@ -161,12 +166,10 @@ end
 ------------------------------------------------------------
 -- Safe fluid transfer
 --
--- 防止：
+-- 外部永远只得到数字。
 --
---   attempt to compare number with string
---
--- transferFluid失败时可能把错误信息作为返回值。
--- 本函数对外永远只返回数字。
+-- 避免之前出现的：
+-- attempt to compare number with string
 ------------------------------------------------------------
 
 local function transferFluidSafe(
@@ -175,9 +178,11 @@ local function transferFluidSafe(
     amount,
     sourceTank
 )
-    amount = math.floor(
-        toNumber(amount)
-    )
+
+    amount =
+        math.floor(
+            toNumber(amount)
+        )
 
     if amount <= 0 then
         return 0
@@ -195,10 +200,11 @@ local function transferFluidSafe(
         end)
 
     --------------------------------------------------------
-    -- Lua/API调用本身异常
+    -- API调用异常
     --------------------------------------------------------
 
     if not callOk then
+
         print(
             "[流体转运异常] "
             .. tostring(a)
@@ -208,13 +214,16 @@ local function transferFluidSafe(
     end
 
     --------------------------------------------------------
-    -- 常见格式：
     -- true, moved
     --------------------------------------------------------
 
     if a == true then
-        if type(b) == "number" then
-            return b
+
+        local moved =
+            tonumber(b)
+
+        if moved then
+            return moved
         end
 
         print(
@@ -226,7 +235,7 @@ local function transferFluidSafe(
     end
 
     --------------------------------------------------------
-    -- 兼容直接返回 moved
+    -- 直接返回 moved
     --------------------------------------------------------
 
     if type(a) == "number" then
@@ -238,10 +247,11 @@ local function transferFluidSafe(
     end
 
     --------------------------------------------------------
-    -- nil/false + reason
+    -- nil/false, reason
     --------------------------------------------------------
 
     if b ~= nil then
+
         print(
             "[流体转运失败] "
             .. tostring(b)
@@ -261,9 +271,11 @@ local function transferItemSafe(
     amount,
     slot
 )
-    amount = math.floor(
-        toNumber(amount)
-    )
+
+    amount =
+        math.floor(
+            toNumber(amount)
+        )
 
     if amount <= 0 then
         return 0
@@ -281,6 +293,7 @@ local function transferItemSafe(
         end)
 
     if not callOk then
+
         print(
             "[物品转运异常] "
             .. tostring(a)
@@ -304,6 +317,7 @@ local function transferItemSafe(
     end
 
     if b ~= nil then
+
         print(
             "[物品转运失败] "
             .. tostring(b)
@@ -314,7 +328,7 @@ local function transferItemSafe(
 end
 
 ------------------------------------------------------------
--- Resolve dust -> plasma material
+-- Dust -> plasma material name
 ------------------------------------------------------------
 
 local function getPlasmaName(item)
@@ -324,9 +338,8 @@ local function getPlasmaName(item)
     end
 
     --------------------------------------------------------
-    -- GT++ / MiscUtils dust
+    -- GT++ / MiscUtils
     --
-    -- 例如：
     -- miscutils:itemDustHypogen
     -- ->
     -- hypogen
@@ -348,12 +361,13 @@ local function getPlasmaName(item)
         if mat
             and mat ~= ""
         then
+
             return string.lower(mat)
         end
     end
 
     --------------------------------------------------------
-    -- GT mapped material
+    -- GT material mapping
     --------------------------------------------------------
 
     local damage =
@@ -376,6 +390,7 @@ end
 local function setPlasmaFilter(
     materialName
 )
+
     local fullName =
         "plasma."
         .. materialName
@@ -392,6 +407,7 @@ local function setPlasmaFilter(
         end)
 
     if not ok then
+
         print(
             "[接口] 设置过滤器失败: "
             .. fullName
@@ -412,6 +428,7 @@ end
 ------------------------------------------------------------
 
 local function clearPlasmaFilter()
+
     pcall(function()
 
         fi.setFluidInterfaceConfiguration(
@@ -421,13 +438,13 @@ local function clearPlasmaFilter()
 end
 
 ------------------------------------------------------------
--- Remove material indicator dust
+-- Remove indicator dust
 --
 -- 注意：
 --
--- 这里只清 SLOT 1 的 1 个材料粉。
+-- 这里只销毁slot 1中的1个材料粉。
 --
--- 两个时空流体绝对不清。
+-- 两种时空流体不动。
 ------------------------------------------------------------
 
 local function clearIndicatorDust()
@@ -439,8 +456,9 @@ local function clearIndicatorDust()
         )
 
     if not item then
+
         print(
-            "[错误] 材料粉已经不存在"
+            "[错误] 材料粉不存在"
         )
 
         return false
@@ -455,6 +473,7 @@ local function clearIndicatorDust()
         )
 
     if moved < 1 then
+
         print(
             "[错误] 无法清理材料粉: "
             .. tostring(
@@ -478,21 +497,207 @@ local function clearIndicatorDust()
 end
 
 ------------------------------------------------------------
+-- Scan spacetime fluids
+--
+-- 不再固定使用 tank 1 / tank 2。
+--
+-- 扫描所有流体槽：
+--
+--   1~50   -> 时间流体
+--   51~100 -> 空间流体
+--
+-- 同时排除 plasma。
+------------------------------------------------------------
+
+local function getSpacetimeFluids()
+
+    local temporal = nil
+    local spatial = nil
+
+    for i = 1,
+        MAX_FLUID_TANK_SCAN
+    do
+
+        local fluid =
+            getFluid(
+                sideCacheBuffer,
+                i
+            )
+
+        if fluid then
+
+            local amount =
+                toNumber(
+                    fluid.amount
+                )
+
+            local name =
+                tostring(
+                    fluid.name or ""
+                )
+
+            ------------------------------------------------
+            -- 排除我们自己输入的plasma
+            ------------------------------------------------
+
+            if amount > 0
+                and not name:match(
+                    "^plasma%."
+                )
+            then
+
+                ------------------------------------------------
+                -- 1~50：时间流体
+                ------------------------------------------------
+
+                if amount >= TEMPORAL_MIN
+                    and amount <= TEMPORAL_MAX
+                then
+
+                    temporal = {
+                        fluid = fluid,
+                        amount = amount,
+                        tank = i
+                    }
+
+                ------------------------------------------------
+                -- 51~100：空间流体
+                ------------------------------------------------
+
+                elseif amount >= SPATIAL_MIN
+                    and amount <= SPATIAL_MAX
+                then
+
+                    spatial = {
+                        fluid = fluid,
+                        amount = amount,
+                        tank = i
+                    }
+                end
+            end
+        end
+    end
+
+    return temporal, spatial
+end
+
+------------------------------------------------------------
+-- Read complete Magmatter round
+------------------------------------------------------------
+
+local function getRoundInput()
+
+    --------------------------------------------------------
+    -- Material indicator dust
+    --------------------------------------------------------
+
+    local item =
+        getItem(
+            sideCacheBuffer,
+            1
+        )
+
+    if not item then
+        return nil
+    end
+
+    --------------------------------------------------------
+    -- Search the two spacetime fluids dynamically
+    --------------------------------------------------------
+
+    local temporal,
+        spatial =
+        getSpacetimeFluids()
+
+    if not temporal
+        or not spatial
+    then
+        return nil
+    end
+
+    --------------------------------------------------------
+    -- Resolve material
+    --------------------------------------------------------
+
+    local materialName =
+        getPlasmaName(item)
+
+    if not materialName then
+
+        return {
+            error =
+                "未知材料粉: "
+                .. tostring(
+                    item.label
+                        or item.name
+                )
+                .. " damage="
+                .. tostring(
+                    item.damage
+                )
+        }
+    end
+
+    --------------------------------------------------------
+    -- Plasma requirement
+    --------------------------------------------------------
+
+    local required =
+        math.abs(
+            spatial.amount
+            - temporal.amount
+        )
+        * PLASMA_MULTIPLIER
+
+    return {
+        item = item,
+
+        temporalFluid =
+            temporal.fluid,
+
+        spatialFluid =
+            spatial.fluid,
+
+        temporalAmount =
+            temporal.amount,
+
+        spatialAmount =
+            spatial.amount,
+
+        temporalTank =
+            temporal.tank,
+
+        spatialTank =
+            spatial.tank,
+
+        materialName =
+            materialName,
+
+        plasmaName =
+            "plasma."
+            .. materialName,
+
+        required =
+            required
+    }
+end
+
+------------------------------------------------------------
 -- AE crafting request
 --
--- amount：
---   当前真正还缺多少 plasma
+-- amount = 当前真正还缺多少plasma
 --
--- 直接 request(amount)
+-- 不计算样板倍率。
+-- 不计算配方次数。
 --
--- 不识别样板倍率
--- 不计算配方次数
+-- 直接request(amount, true)。
 ------------------------------------------------------------
 
 local function requestPlasmaSynthesis(
     materialName,
     amount
 )
+
     amount =
         math.floor(
             tonumber(amount)
@@ -506,6 +711,7 @@ local function requestPlasmaSynthesis(
     if amount
         > MAX_REQUEST_AMOUNT
     then
+
         amount =
             MAX_REQUEST_AMOUNT
     end
@@ -523,7 +729,7 @@ local function requestPlasmaSynthesis(
     )
 
     --------------------------------------------------------
-    -- 查询AE craftable
+    -- Query craftable
     --------------------------------------------------------
 
     local ok, craftables =
@@ -535,9 +741,12 @@ local function requestPlasmaSynthesis(
         end)
 
     if not ok then
+
         print(
             "[下单] 查询失败: "
-            .. tostring(craftables)
+            .. tostring(
+                craftables
+            )
         )
 
         return nil
@@ -547,6 +756,7 @@ local function requestPlasmaSynthesis(
         ~= "table"
         or not craftables[1]
     then
+
         print(
             "[下单] 未找到配方: "
             .. fullName
@@ -560,7 +770,7 @@ local function requestPlasmaSynthesis(
     )
 
     --------------------------------------------------------
-    -- 直接请求最终目标量
+    -- Direct request
     --------------------------------------------------------
 
     local reqOk, status =
@@ -573,6 +783,7 @@ local function requestPlasmaSynthesis(
         end)
 
     if not reqOk then
+
         print(
             "[下单] request异常: "
             .. tostring(status)
@@ -582,6 +793,7 @@ local function requestPlasmaSynthesis(
     end
 
     if not status then
+
         print(
             "[下单] 没有任务对象"
         )
@@ -590,7 +802,7 @@ local function requestPlasmaSynthesis(
     end
 
     --------------------------------------------------------
-    -- 等待 AE crafting plan 计算完成
+    -- Wait until crafting plan calculation finishes
     --------------------------------------------------------
 
     for i = 1,
@@ -614,12 +826,13 @@ local function requestPlasmaSynthesis(
             end)
 
         ----------------------------------------------------
-        -- Cancelled
+        -- Request canceled
         ----------------------------------------------------
 
         if okCancel
             and canceled
         then
+
             print(
                 "[下单] 请求失败/取消: "
                 .. tostring(
@@ -648,7 +861,7 @@ local function requestPlasmaSynthesis(
             )
 
         ----------------------------------------------------
-        -- 已退出 computing 阶段
+        -- Planning finished
         ----------------------------------------------------
 
         if not computing then
@@ -656,12 +869,14 @@ local function requestPlasmaSynthesis(
             if okDone
                 and done
             then
+
                 print(
                     "[下单] 任务已快速完成: "
                     .. fullName
                 )
 
             else
+
                 print(
                     "[下单] 已真正提交到CPU: "
                     .. fullName
@@ -675,6 +890,7 @@ local function requestPlasmaSynthesis(
         end
 
         if i % 5 == 0 then
+
             print(
                 "[下单] AE正在计算配方... "
                 .. tostring(i)
@@ -693,12 +909,13 @@ local function requestPlasmaSynthesis(
 end
 
 ------------------------------------------------------------
--- Get current crafting state
+-- Crafting status
 ------------------------------------------------------------
 
 local function getCraftState(
     status
 )
+
     if not status then
         return "none"
     end
@@ -718,6 +935,7 @@ local function getCraftState(
     if okCancel
         and canceled
     then
+
         return
             "canceled",
             cancelInfo
@@ -740,12 +958,14 @@ local function getCraftState(
         if doneInfo
             == "computing"
         then
+
             return
                 "computing",
                 doneInfo
         end
 
         if done then
+
             return
                 "done",
                 doneInfo
@@ -757,13 +977,14 @@ local function getCraftState(
     end
 
     --------------------------------------------------------
-    -- isCanceled也可能返回computing
+    -- isCanceled may also report computing
     --------------------------------------------------------
 
     if okCancel
         and cancelInfo
             == "computing"
     then
+
         return
             "computing",
             cancelInfo
@@ -773,13 +994,14 @@ local function getCraftState(
 end
 
 ------------------------------------------------------------
--- Feed exact plasma amount
+-- Feed exact plasma requirement
 ------------------------------------------------------------
 
 local function feedPlasma(
     materialName,
     requiredAmount
 )
+
     requiredAmount =
         math.floor(
             toNumber(
@@ -788,6 +1010,7 @@ local function feedPlasma(
         )
 
     if requiredAmount <= 0 then
+
         print(
             "[错误] Plasma需求量为0"
         )
@@ -800,13 +1023,14 @@ local function feedPlasma(
         .. materialName
 
     --------------------------------------------------------
-    -- Select Fluid Interface target
+    -- Set Fluid Interface
     --------------------------------------------------------
 
     if not setPlasmaFilter(
         materialName
     )
     then
+
         return false
     end
 
@@ -825,7 +1049,7 @@ local function feedPlasma(
         0
 
     --------------------------------------------------------
-    -- Feed until exact amount reached
+    -- Exact feeding loop
     --------------------------------------------------------
 
     while remaining > 0 do
@@ -840,6 +1064,7 @@ local function feedPlasma(
         local fluidName = nil
 
         if tank then
+
             available =
                 toNumber(
                     tank.amount
@@ -850,7 +1075,7 @@ local function feedPlasma(
         end
 
         ----------------------------------------------------
-        -- Correct target plasma available
+        -- Correct plasma available
         ----------------------------------------------------
 
         if available > 0
@@ -897,7 +1122,7 @@ local function feedPlasma(
             end
 
         ----------------------------------------------------
-        -- Interface still contains wrong/previous fluid
+        -- Fluid Interface still contains previous fluid
         ----------------------------------------------------
 
         elseif available > 0
@@ -930,13 +1155,13 @@ local function feedPlasma(
             os.sleep(0.5)
 
         ----------------------------------------------------
-        -- No target plasma currently available
+        -- No target plasma
         ----------------------------------------------------
 
         else
 
             ------------------------------------------------
-            -- No AE request yet
+            -- No request yet
             ------------------------------------------------
 
             if not craftStatus then
@@ -955,6 +1180,7 @@ local function feedPlasma(
                     nil
 
                 if not craftStatus then
+
                     print(
                         "[下单] 本次失败，5秒后重试"
                     )
@@ -962,6 +1188,7 @@ local function feedPlasma(
                     os.sleep(5)
 
                 else
+
                     os.sleep(0.5)
                 end
 
@@ -1004,7 +1231,7 @@ local function feedPlasma(
                     os.sleep(0.5)
 
                 --------------------------------------------
-                -- Crafting
+                -- CPU running
                 --------------------------------------------
 
                 elseif state
@@ -1030,7 +1257,7 @@ local function feedPlasma(
                     os.sleep(0.5)
 
                 --------------------------------------------
-                -- Done
+                -- Task done
                 --------------------------------------------
 
                 elseif state
@@ -1038,6 +1265,7 @@ local function feedPlasma(
                 then
 
                     if not craftDoneAt then
+
                         craftDoneAt =
                             now
 
@@ -1051,14 +1279,9 @@ local function feedPlasma(
                         >= CRAFT_DONE_GRACE
                     then
 
-                        ------------------------------------------------
-                        -- 任务做完但仍缺流体
-                        -- 按新的remaining重新请求
-                        ------------------------------------------------
-
                         print(
                             string.format(
-                                "[AE] 仍缺 %d mB，重新补单",
+                                "[AE] 任务完成后仍缺 %d mB，重新补单",
                                 remaining
                             )
                         )
@@ -1070,6 +1293,7 @@ local function feedPlasma(
                             nil
 
                     else
+
                         os.sleep(0.5)
                     end
 
@@ -1115,7 +1339,7 @@ local function feedPlasma(
                             now
                     end
 
-                    -- unknown不重复下单
+                    -- 不重复下单，避免重复任务
                     os.sleep(1)
                 end
             end
@@ -1123,7 +1347,7 @@ local function feedPlasma(
     end
 
     --------------------------------------------------------
-    -- Exact amount delivered
+    -- Done
     --------------------------------------------------------
 
     clearPlasmaFilter()
@@ -1134,117 +1358,6 @@ local function feedPlasma(
     )
 
     return true
-end
-
-------------------------------------------------------------
--- Check whether a complete new round exists
-------------------------------------------------------------
-
-local function getRoundInput()
-
-    local item =
-        getItem(
-            sideCacheBuffer,
-            1
-        )
-
-    if not item then
-        return nil
-    end
-
-    local fluidA =
-        getFluid(
-            sideCacheBuffer,
-            1
-        )
-
-    local fluidB =
-        getFluid(
-            sideCacheBuffer,
-            2
-        )
-
-    --------------------------------------------------------
-    -- 材料粉已经来了，但两个流体尚未全部到齐
-    --------------------------------------------------------
-
-    if not fluidA
-        or not fluidB
-    then
-        return nil
-    end
-
-    local amountA =
-        toNumber(
-            fluidA.amount
-        )
-
-    local amountB =
-        toNumber(
-            fluidB.amount
-        )
-
-    if amountA <= 0
-        or amountB <= 0
-    then
-        return nil
-    end
-
-    --------------------------------------------------------
-    -- Resolve target material
-    --------------------------------------------------------
-
-    local materialName =
-        getPlasmaName(
-            item
-        )
-
-    if not materialName then
-
-        return {
-            error =
-                "未知材料粉: "
-                .. tostring(
-                    item.label
-                        or item.name
-                )
-                .. " damage="
-                .. tostring(
-                    item.damage
-                )
-        }
-    end
-
-    --------------------------------------------------------
-    -- Calculate plasma requirement
-    --------------------------------------------------------
-
-    local required =
-        math.abs(
-            amountA
-            - amountB
-        )
-        * PLASMA_MULTIPLIER
-
-    return {
-        item = item,
-
-        fluidA = fluidA,
-        fluidB = fluidB,
-
-        amountA = amountA,
-        amountB = amountB,
-
-        materialName =
-            materialName,
-
-        plasmaName =
-            "plasma."
-            .. materialName,
-
-        required =
-            required
-    }
 end
 
 ------------------------------------------------------------
@@ -1262,7 +1375,7 @@ local function processRound(round)
     print("")
 
     --------------------------------------------------------
-    -- Print indicator information
+    -- Material
     --------------------------------------------------------
 
     print(
@@ -1273,29 +1386,43 @@ local function processRound(round)
         )
     )
 
-    print(
-        string.format(
-            "流体A: %s × %d",
-            tostring(
-                round.fluidA.label
-                    or round.fluidA.name
-            ),
-            round.amountA
-        )
-    )
+    --------------------------------------------------------
+    -- Temporal fluid
+    --------------------------------------------------------
 
     print(
         string.format(
-            "流体B: %s × %d",
+            "时间流体: %s × %d mB [tank %d]",
             tostring(
-                round.fluidB.label
-                    or round.fluidB.name
+                round.temporalFluid.label
+                    or round.temporalFluid.name
             ),
-            round.amountB
+            round.temporalAmount,
+            round.temporalTank
+        )
+    )
+
+    --------------------------------------------------------
+    -- Spatial fluid
+    --------------------------------------------------------
+
+    print(
+        string.format(
+            "空间流体: %s × %d mB [tank %d]",
+            tostring(
+                round.spatialFluid.label
+                    or round.spatialFluid.name
+            ),
+            round.spatialAmount,
+            round.spatialTank
         )
     )
 
     print("")
+
+    --------------------------------------------------------
+    -- Requirement
+    --------------------------------------------------------
 
     print(
         "目标流体: "
@@ -1313,27 +1440,28 @@ local function processRound(round)
     print("")
 
     --------------------------------------------------------
-    -- Protect against impossible zero requirement
+    -- Sanity check
     --------------------------------------------------------
 
     if round.required <= 0 then
 
         print(
-            "[错误] 两种流体数量相同，计算出的Plasma需求为0"
+            "[错误] 两种时空流体数量相同"
+        )
+
+        print(
+            "[错误] Plasma需求计算结果为0"
         )
 
         return false
     end
 
     --------------------------------------------------------
-    -- IMPORTANT:
-    --
-    -- 这里只销毁1个材料粉。
-    --
-    -- 两种时空流体必须留在缓存仓里。
+    -- Remove ONLY the dust
     --------------------------------------------------------
 
-    if not clearIndicatorDust() then
+    if not clearIndicatorDust()
+    then
 
         print(
             "[错误] 材料粉清理失败"
@@ -1345,7 +1473,7 @@ local function processRound(round)
     os.sleep(0.5)
 
     --------------------------------------------------------
-    -- Feed exact plasma amount
+    -- Feed exact plasma
     --------------------------------------------------------
 
     if not feedPlasma(
@@ -1362,7 +1490,7 @@ local function processRound(round)
     end
 
     --------------------------------------------------------
-    -- Round complete
+    -- Round finished
     --------------------------------------------------------
 
     print("")
@@ -1386,20 +1514,17 @@ local function processRound(round)
     print("")
 
     --------------------------------------------------------
-    -- 这里：
-    --
     -- 不清缓存仓
-    -- 不清两个流体
-    -- 不等待progress
+    -- 不清两个时空流体
     --
-    -- 下一轮由新的材料粉作为触发条件。
+    -- 异化器会自行消费。
     --------------------------------------------------------
 
     return true
 end
 
 ------------------------------------------------------------
--- Machine on/off handling
+-- Machine enable handling
 ------------------------------------------------------------
 
 local function waitIfMachineDisabled()
@@ -1417,6 +1542,7 @@ local function waitIfMachineDisabled()
     if not ok
         or allowed
     then
+
         return
     end
 
@@ -1460,6 +1586,7 @@ local function main()
     --------------------------------------------------------
 
     if not trans then
+
         print(
             "错误：未找到 transposer"
         )
@@ -1468,6 +1595,7 @@ local function main()
     end
 
     if not fi then
+
         print(
             "错误：未找到 fluid_interface"
         )
@@ -1482,7 +1610,7 @@ local function main()
     print("")
 
     print(
-        "缓存仓方向 : WEST"
+        "缓存仓方向 : DOWN"
     )
 
     print(
@@ -1490,7 +1618,7 @@ local function main()
     )
 
     print(
-        "Fluid接口  : DOWN"
+        "Fluid接口  : EAST"
     )
 
     print("")
@@ -1512,23 +1640,27 @@ local function main()
 
         waitIfMachineDisabled()
 
+        ----------------------------------------------------
+        -- New dust?
+        ----------------------------------------------------
+
         local item =
             getItem(
                 sideCacheBuffer,
                 1
             )
 
-        ----------------------------------------------------
-        -- Dust appeared -> potential new round
-        ----------------------------------------------------
-
         if item then
+
+            ------------------------------------------------
+            -- Try to read complete round
+            ------------------------------------------------
 
             local round =
                 getRoundInput()
 
             ------------------------------------------------
-            -- Full round ready
+            -- Complete input
             ------------------------------------------------
 
             if round
@@ -1536,8 +1668,7 @@ local function main()
             then
 
                 ------------------------------------------------
-                -- 等0.5秒，再读取一次
-                -- 避免输出正在变化时抢跑
+                -- Wait a short moment and confirm again
                 ------------------------------------------------
 
                 os.sleep(0.5)
@@ -1549,9 +1680,28 @@ local function main()
                     and not confirmed.error
                 then
 
-                    processRound(
-                        confirmed
-                    )
+                    ------------------------------------------------
+                    -- Make sure values are stable
+                    ------------------------------------------------
+
+                    if confirmed.temporalAmount
+                        == round.temporalAmount
+                        and confirmed.spatialAmount
+                            == round.spatialAmount
+                        and confirmed.materialName
+                            == round.materialName
+                    then
+
+                        processRound(
+                            confirmed
+                        )
+
+                    else
+
+                        print(
+                            "[等待] 输入仍在变化，继续等待..."
+                        )
+                    end
                 end
 
             ------------------------------------------------
@@ -1578,7 +1728,7 @@ local function main()
                 return
 
             ------------------------------------------------
-            -- Dust arrived but fluids not ready
+            -- Dust exists, fluids not complete
             ------------------------------------------------
 
             else
@@ -1592,8 +1742,43 @@ local function main()
                 then
 
                     print(
-                        "[等待] 材料粉已到，等待两种时空流体..."
+                        "[等待] 材料粉已到，扫描两种时空流体..."
                     )
+
+                    ------------------------------------------------
+                    -- 调试显示当前所有流体槽
+                    ------------------------------------------------
+
+                    for i = 1,
+                        MAX_FLUID_TANK_SCAN
+                    do
+
+                        local f =
+                            getFluid(
+                                sideCacheBuffer,
+                                i
+                            )
+
+                        if f
+                            and toNumber(
+                                f.amount
+                            ) > 0
+                        then
+
+                            print(
+                                string.format(
+                                    "  tank %d: %s × %d",
+                                    i,
+                                    tostring(
+                                        f.name
+                                    ),
+                                    toNumber(
+                                        f.amount
+                                    )
+                                )
+                            )
+                        end
+                    end
 
                     lastWaitingPrint =
                         now
@@ -1616,7 +1801,7 @@ local ok, err =
     )
 
 ------------------------------------------------------------
--- Always clear Fluid Interface filter on exit
+-- Always clear Fluid Interface filter
 ------------------------------------------------------------
 
 clearPlasmaFilter()
